@@ -2,7 +2,7 @@
 
 use ruff_python_ast::AstNode;
 
-use crate::db::{HasJar, SemanticDb, SemanticJar};
+use crate::db::{HasJar, QueryResult, SemanticDb, SemanticJar};
 use crate::module::ModuleName;
 use crate::symbols::{Definition, ImportFromDefinition, SymbolId};
 use crate::types::Type;
@@ -10,23 +10,24 @@ use crate::FileId;
 
 // FIXME: Figure out proper dead-lock free synchronisation now that this takes `&db` instead of `&mut db`.
 #[tracing::instrument(level = "trace", skip(db))]
-pub fn infer_symbol_type<Db>(db: &Db, file_id: FileId, symbol_id: SymbolId) -> Type
+pub fn infer_symbol_type<Db>(db: &Db, file_id: FileId, symbol_id: SymbolId) -> QueryResult<Type>
 where
     Db: SemanticDb + HasJar<SemanticJar>,
 {
-    let symbols = db.symbol_table(file_id);
+    let symbols = db.symbol_table(file_id)?;
     let defs = symbols.definitions(symbol_id);
 
     if let Some(ty) = db
-        .jar()
+        .jar()?
         .type_store
         .get_cached_symbol_type(file_id, symbol_id)
     {
-        return ty;
+        return Ok(ty);
     }
 
     // TODO handle multiple defs, conditional defs...
     assert_eq!(defs.len(), 1);
+    let type_store = &db.jar()?.type_store;
 
     let ty = match &defs[0] {
         Definition::ImportFrom(ImportFromDefinition {
@@ -37,11 +38,11 @@ where
             // TODO relative imports
             assert!(matches!(level, 0));
             let module_name = ModuleName::new(module.as_ref().expect("TODO relative imports"));
-            if let Some(module) = db.resolve_module(module_name) {
-                let remote_file_id = module.path(db).file();
-                let remote_symbols = db.symbol_table(remote_file_id);
+            if let Some(module) = db.resolve_module(module_name)? {
+                let remote_file_id = module.path(db)?.file();
+                let remote_symbols = db.symbol_table(remote_file_id)?;
                 if let Some(remote_symbol_id) = remote_symbols.root_symbol_id_by_name(name) {
-                    db.infer_symbol_type(remote_file_id, remote_symbol_id)
+                    db.infer_symbol_type(remote_file_id, remote_symbol_id)?
                 } else {
                     Type::Unknown
                 }
@@ -49,44 +50,43 @@ where
                 Type::Unknown
             }
         }
-        Definition::ClassDef(node_key) => db
-            .jar()
-            .type_store
-            .get_cached_node_type(file_id, node_key.erased())
-            .unwrap_or_else(|| {
-                let parsed = db.parse(file_id);
-                let ast = parsed.ast();
-                let node = node_key.resolve_unwrap(ast.as_any_node_ref());
+        Definition::ClassDef(node_key) => {
+            match type_store.get_cached_node_type(file_id, node_key.erased()) {
+                Some(ty) => ty,
+                None => {
+                    let parsed = db.parse(file_id)?;
+                    let ast = parsed.ast();
+                    let node = node_key.resolve_unwrap(ast.as_any_node_ref());
 
-                let store = &db.jar().type_store;
-                let ty: Type = store.add_class(file_id, &node.name.id).into();
-                store.cache_node_type(file_id, *node_key.erased(), ty);
-                ty
-            }),
-        Definition::FunctionDef(node_key) => db
-            .jar()
-            .type_store
-            .get_cached_node_type(file_id, node_key.erased())
-            .unwrap_or_else(|| {
-                let parsed = db.parse(file_id);
-                let ast = parsed.ast();
-                let node = node_key
-                    .resolve(ast.as_any_node_ref())
-                    .expect("node key should resolve");
+                    let ty: Type = type_store.add_class(file_id, &node.name.id).into();
+                    type_store.cache_node_type(file_id, *node_key.erased(), ty);
+                    ty
+                }
+            }
+        }
+        Definition::FunctionDef(node_key) => {
+            match type_store.get_cached_node_type(file_id, node_key.erased()) {
+                Some(ty) => ty,
+                None => {
+                    let parsed = db.parse(file_id)?;
+                    let ast = parsed.ast();
+                    let node = node_key
+                        .resolve(ast.as_any_node_ref())
+                        .expect("node key should resolve");
 
-                let store = &db.jar().type_store;
-                let ty = store.add_function(file_id, &node.name.id).into();
-                store.cache_node_type(file_id, *node_key.erased(), ty);
-                ty
-            }),
+                    let ty = type_store.add_function(file_id, &node.name.id).into();
+                    type_store.cache_node_type(file_id, *node_key.erased(), ty);
+                    ty
+                }
+            }
+        }
         _ => todo!("other kinds of definitions"),
     };
 
-    db.jar()
-        .type_store
-        .cache_symbol_type(file_id, symbol_id, ty);
+    type_store.cache_symbol_type(file_id, symbol_id, ty);
+
     // TODO record dependencies
-    ty
+    Ok(ty)
 }
 
 #[cfg(test)]
@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_import_to_class() -> std::io::Result<()> {
+    fn follow_import_to_class() -> anyhow::Result<()> {
         let TestCase {
             src,
             db,
@@ -134,18 +134,18 @@ mod tests {
         std::fs::write(a_path, "from b import C as D")?;
         std::fs::write(b_path, "class C: pass")?;
         let a_file = db
-            .resolve_module(ModuleName::new("a"))
+            .resolve_module(ModuleName::new("a"))?
             .expect("module should be found")
-            .path(&db)
+            .path(&db)?
             .file();
-        let a_syms = db.symbol_table(a_file);
+        let a_syms = db.symbol_table(a_file)?;
         let d_sym = a_syms
             .root_symbol_id_by_name("D")
             .expect("D symbol should be found");
 
-        let ty = db.infer_symbol_type(a_file, d_sym);
+        let ty = db.infer_symbol_type(a_file, d_sym)?;
 
-        let jar = HasJar::<SemanticJar>::jar(&db);
+        let jar = HasJar::<SemanticJar>::jar(&db)?;
 
         assert!(matches!(ty, Type::Class(_)));
         assert_eq!(format!("{}", ty.display(&jar.type_store)), "Literal[C]");
