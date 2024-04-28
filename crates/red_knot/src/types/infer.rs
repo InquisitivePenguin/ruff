@@ -51,33 +51,31 @@ where
             }
         }
         Definition::ClassDef(node_key) => {
-            match type_store.get_cached_node_type(file_id, node_key.erased()) {
-                Some(ty) => ty,
-                None => {
-                    let parsed = db.parse(file_id)?;
-                    let ast = parsed.ast();
-                    let node = node_key.resolve_unwrap(ast.as_any_node_ref());
+            if let Some(ty) = type_store.get_cached_node_type(file_id, node_key.erased()) {
+                ty
+            } else {
+                let parsed = db.parse(file_id)?;
+                let ast = parsed.ast();
+                let node = node_key.resolve_unwrap(ast.as_any_node_ref());
 
-                    let ty: Type = type_store.add_class(file_id, &node.name.id).into();
-                    type_store.cache_node_type(file_id, *node_key.erased(), ty);
-                    ty
-                }
+                let ty: Type = type_store.add_class(file_id, &node.name.id).into();
+                type_store.cache_node_type(file_id, *node_key.erased(), ty);
+                ty
             }
         }
         Definition::FunctionDef(node_key) => {
-            match type_store.get_cached_node_type(file_id, node_key.erased()) {
-                Some(ty) => ty,
-                None => {
-                    let parsed = db.parse(file_id)?;
-                    let ast = parsed.ast();
-                    let node = node_key
-                        .resolve(ast.as_any_node_ref())
-                        .expect("node key should resolve");
+            if let Some(ty) = type_store.get_cached_node_type(file_id, node_key.erased()) {
+                ty
+            } else {
+                let parsed = db.parse(file_id)?;
+                let ast = parsed.ast();
+                let node = node_key
+                    .resolve(ast.as_any_node_ref())
+                    .expect("node key should resolve");
 
-                    let ty = type_store.add_function(file_id, &node.name.id).into();
-                    type_store.cache_node_type(file_id, *node_key.erased(), ty);
-                    ty
-                }
+                let ty = type_store.add_function(file_id, &node.name.id).into();
+                type_store.cache_node_type(file_id, *node_key.erased(), ty);
+                ty
             }
         }
         _ => todo!("other kinds of definitions"),
